@@ -87,6 +87,7 @@
         order => asc | desc | undefined, % by timestamp
         start => binary() | undefined, % ISO timestamp
         'end' => binary() | undefined, % ISO timestamp
+        box => all | inbox | archive | other,
         archive => boolean()
        }.
 
@@ -123,10 +124,11 @@ inbox_opts() ->
     config_parser_helper:default_mod_config(mod_inbox).
 
 inbox_opts(regular) ->
-    inbox_opts();
+    (inbox_opts())#{boxes => [<<"other">>]};
 inbox_opts(async_pools) ->
     (inbox_opts())#{backend => rdbms_async,
-                    async_writer => #{pool_size => 4}}.
+                    async_writer => #{pool_size => 4},
+                    boxes => [<<"other">>]}.
 
 skip_or_run_inbox_tests(TestCases) ->
     case (not ct_helper:is_ct_running())
@@ -460,9 +462,16 @@ make_inbox_form(GetParams) ->
 make_inbox_form(GetParams, true) ->
     BoxL = case maps:get(box, GetParams, both) of
                both -> [];
-               archive -> [escalus_stanza:field_el(<<"archive">>, <<"boolean">>, <<"true">>)];
-               active -> [escalus_stanza:field_el(<<"archive">>, <<"boolean">>, <<"false">>)]
+               all -> [escalus_stanza:field_el(<<"box">>, <<"list-multi">>, <<"all">>)];
+               inbox -> [escalus_stanza:field_el(<<"box">>, <<"list-multi">>, <<"inbox">>)];
+               archive -> [escalus_stanza:field_el(<<"box">>, <<"list-multi">>, <<"archive">>)];
+               other -> [escalus_stanza:field_el(<<"box">>, <<"list-multi">>, <<"other">>)]
            end,
+    Archive = case maps:get(archive, GetParams, none) of
+                  none -> [];
+                  true -> [escalus_stanza:field_el(<<"archive">>, <<"boolean">>, <<"true">>)];
+                  false -> [escalus_stanza:field_el(<<"archive">>, <<"boolean">>, <<"false">>)]
+              end,
     OrderL = case maps:get(order, GetParams, undefined) of
                  undefined -> [];
                  Order -> [escalus_stanza:field_el(<<"order">>, <<"list-single">>, order_to_bin(Order))]
@@ -475,14 +484,10 @@ make_inbox_form(GetParams, true) ->
                undefined -> [];
                End -> [escalus_stanza:field_el(<<"end">>, <<"text-single">>, End)]
            end,
-    Archive = case maps:get(archive, GetParams, undefined) of
-                  undefined -> [];
-                  ArchVal -> [escalus_stanza:field_el(<<"archive">>, <<"boolean">>, ArchVal)]
-              end,
     FormTypeL = [escalus_stanza:field_el(<<"FORM_TYPE">>, <<"hidden">>, ?NS_ESL_INBOX)],
     HiddenReadL = [escalus_stanza:field_el(<<"hidden_read">>, <<"text-single">>,
                                            bool_to_bin(maps:get(hidden_read, GetParams, false)))],
-    Fields = FormTypeL ++ BoxL ++ OrderL ++ StartL ++ EndL ++ HiddenReadL ++ Archive,
+    Fields = FormTypeL ++ BoxL ++ Archive ++ OrderL ++ StartL ++ EndL ++ HiddenReadL,
     escalus_stanza:x_data_form(<<"submit">>, Fields);
 
 make_inbox_form(GetParams, false) ->
@@ -725,7 +730,7 @@ parse_form_field(FieldEl, Acc0) ->
     Info0 = #{ type => Type, value => Value },
     Info1 =
     case Type of
-        <<"list-single">> ->
+        _ when Type =:= <<"list-single">>; Type =:= <<"list-multi">> ->
             Info0#{ options => exml_query:paths(FieldEl, [{element, <<"option">>},
                                                           {element, <<"value">>},
                                                           cdata]) };
