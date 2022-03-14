@@ -518,6 +518,12 @@ GO
 CREATE INDEX i_inbox_su_ts ON inbox(lserver, luser, timestamp);
 GO
 
+CREATE TABLE dbo.inbox_boxes (
+    name NVARCHAR(64) NOT NULL UNIQUE PRIMARY KEY,
+    id TINYINT NOT NULL UNIQUE
+)
+GO
+
 CREATE TABLE dbo.pubsub_nodes (
     nidx BIGINT           IDENTITY(1,1) PRIMARY KEY,
     p_key NVARCHAR(150)   NOT NULL,

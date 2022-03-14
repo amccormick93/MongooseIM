@@ -361,6 +361,10 @@ CREATE INDEX i_inbox_timestamp
     ON inbox
     USING BTREE(lserver, luser, timestamp);
 
+CREATE TABLE inbox_boxes (
+    name VARCHAR(64) NOT NULL UNIQUE PRIMARY KEY,
+    id SMALLINT NOT NULL UNIQUE);
+
 CREATE TABLE pubsub_nodes (
     nidx               BIGSERIAL PRIMARY KEY,
     p_key VARCHAR(250) NOT NULL,
