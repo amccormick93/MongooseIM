@@ -35,6 +35,7 @@
     inbox_unread_count/2, remove_domain/3, remove_user/3, user_send_packet/4
 ]).
 
+-export([process_inbox_boxes/1]).
 -export([config_metrics/1]).
 
 -type message_type() :: one2one | groupchat.
@@ -47,7 +48,7 @@
         'end' => integer(),
         order => asc | desc,
         hidden_read => true | false,
-        archive => boolean() | integer()
+        box => [binary()]
        }.
 
 -type count_res() :: ok | {ok, non_neg_integer()} | {error, term()}.
@@ -120,17 +121,20 @@ config_spec() ->
                                                                validate = {enum, Markers}}},
                   <<"groupchat">> => #list{items = #option{type = atom,
                                                            validate = {enum, [muc, muclight]}}},
+                  <<"boxes">> => #list{items = #option{type = binary, validate = non_empty}},
                   <<"aff_changes">> => #option{type = boolean},
                   <<"remove_on_kicked">> => #option{type = boolean},
                   <<"iqdisc">> => mongoose_config_spec:iqdisc()
         },
         defaults = #{<<"backend">> => rdbms,
                      <<"groupchat">> => [muclight],
+                     <<"boxes">> => [],
                      <<"aff_changes">> => true,
                      <<"remove_on_kicked">> => true,
                      <<"reset_markers">> => [<<"displayed">>],
                      <<"iqdisc">> => no_queue
                     },
+        process = fun ?MODULE:process_inbox_boxes/1,
         format_items = map
     }.
 
@@ -142,6 +146,10 @@ async_config_spec() ->
        include = always
       }.
 
+process_inbox_boxes(Config = #{boxes := Boxes}) ->
+    AllBoxes = [<<"all">>, <<"inbox">>, <<"archive">> | Boxes ],
+    Config#{boxes := AllBoxes}.
+
 %%%%%%%%%%%%%%%%%%%
 %% Process IQ
 -spec process_iq(Acc :: mongoose_acc:t(),
@@ -149,15 +157,15 @@ async_config_spec() ->
                  To :: jid:jid(),
                  IQ :: jlib:iq(),
                  Extra :: map()) -> {stop, mongoose_acc:t()} | {mongoose_acc:t(), jlib:iq()}.
-process_iq(Acc, _From, _To, #iq{type = get, sub_el = SubEl} = IQ, _Extra) ->
-    Form = build_inbox_form(),
+process_iq(Acc, _From, _To, #iq{type = get, sub_el = SubEl} = IQ, #{host_type := HostType}) ->
+    Form = build_inbox_form(HostType),
     SubElWithForm = SubEl#xmlel{ children = [Form] },
     {Acc, IQ#iq{type = result, sub_el = SubElWithForm}};
 process_iq(Acc, From, _To, #iq{type = set, id = IqId, sub_el = QueryEl} = IQ, _Extra) ->
     HostType = mongoose_acc:host_type(Acc),
     LUser = From#jid.luser,
     LServer = From#jid.lserver,
-    case query_to_params(QueryEl) of
+    case query_to_params(HostType, QueryEl) of
         {error, bad_request, Msg} ->
             {Acc, IQ#iq{type = error, sub_el = [mongoose_xmpp_errors:bad_request(<<"en">>, Msg)]}};
         Params ->
@@ -340,18 +348,21 @@ build_result_el(Name, CountBin) ->
 
 %%%%%%%%%%%%%%%%%%%
 %% iq-get
--spec build_inbox_form() -> exml:element().
-build_inbox_form() ->
+-spec build_inbox_form(mongooseim:host_type()) -> exml:element().
+build_inbox_form(HostType) ->
     OrderOptions = [
                     {<<"Ascending by timestamp">>, <<"asc">>},
                     {<<"Descending by timestamp">>, <<"desc">>}
                    ],
+    AllBoxes = gen_mod:get_module_opt(HostType, ?MODULE, boxes),
+    BoxOptions = [{Tag, Tag} || Tag <- AllBoxes],
     FormFields = [
                   jlib:form_field({<<"FORM_TYPE">>, <<"hidden">>, ?NS_ESL_INBOX}),
                   text_single_form_field(<<"start">>),
                   text_single_form_field(<<"end">>),
-                  list_single_form_field(<<"order">>, <<"desc">>, OrderOptions),
                   text_single_form_field(<<"hidden_read">>, <<"false">>),
+                  list_form_field(<<"order">>, <<"list-single">>, <<"desc">>, OrderOptions),
+                  list_form_field(<<"box">>, <<"list-multi">>, <<"all">>, BoxOptions),
                   jlib:form_field({<<"archive">>, <<"boolean">>, <<"false">>})
                  ],
     #xmlel{name = <<"x">>,
@@ -367,15 +378,16 @@ text_single_form_field(Var, DefaultValue) ->
     #xmlel{name = <<"field">>,
            attrs = [{<<"var">>, Var}, {<<"type">>, <<"text-single">>}, {<<"value">>, DefaultValue}]}.
 
--spec list_single_form_field(Var :: binary(),
-                             Default :: binary(),
-                             Options :: [{Label :: binary(), Value :: binary()}]) ->
+-spec list_form_field(Var :: binary(),
+                      Type :: binary(),
+                      Default :: binary(),
+                      Options :: [{Label :: binary(), Value :: binary()}]) ->
     exml:element().
-list_single_form_field(Var, Default, Options) ->
+list_form_field(Var, Type, Default, Options) ->
     Value = form_field_value(Default),
     #xmlel{
        name = <<"field">>,
-       attrs = [{<<"var">>, Var}, {<<"type">>, <<"list-single">>}],
+       attrs = [{<<"var">>, Var}, {<<"type">>, Type}],
        children = [Value | [ form_field_option(Label, OptValue) || {Label, OptValue} <- Options ]]
       }.
 
@@ -393,10 +405,10 @@ form_field_value(Value) ->
 
 %%%%%%%%%%%%%%%%%%%
 %% iq-set
--spec query_to_params(QueryEl :: exml:element()) ->
+-spec query_to_params(mongooseim:host_type(), QueryEl :: exml:element()) ->
     get_inbox_params() | {error, bad_request, Msg :: binary()}.
-query_to_params(QueryEl) ->
-    case form_to_params(exml_query:subelement_with_ns(QueryEl, ?NS_XDATA)) of
+query_to_params(HostType, QueryEl) ->
+    case form_to_params(HostType, exml_query:subelement_with_ns(QueryEl, ?NS_XDATA)) of
         {error, bad_request, Msg} ->
             {error, bad_request, Msg};
         Params ->
@@ -425,72 +437,83 @@ maybe_rsm(_) ->
 wrong_rsm_message() ->
     <<"bad-request">>.
 
--spec form_to_params(FormEl :: exml:element() | undefined) ->
+-spec form_to_params(mongooseim:host_type(), FormEl :: exml:element() | undefined) ->
     get_inbox_params() | {error, bad_request, Msg :: binary()}.
-form_to_params(undefined) ->
+form_to_params(_, undefined) ->
     #{ order => desc };
-form_to_params(FormEl) ->
+form_to_params(HostType, FormEl) ->
     ParsedFields = jlib:parse_xdata_fields(exml_query:subelements(FormEl, <<"field">>)),
     ?LOG_DEBUG(#{what => inbox_parsed_form_fields, parsed_fields => ParsedFields}),
-    fields_to_params(ParsedFields, #{ order => desc }).
+    fields_to_params(HostType, ParsedFields, #{ order => desc }).
 
--spec fields_to_params([{Var :: binary(), Values :: [binary()]}], Acc :: get_inbox_params()) ->
+-spec fields_to_params(mongooseim:host_type(),
+                       [{Var :: binary(), Values :: [binary()]}], Acc :: get_inbox_params()) ->
     get_inbox_params() | {error, bad_request, Msg :: binary()}.
-fields_to_params([], Acc) ->
+fields_to_params(_, [], Acc) ->
     Acc;
-fields_to_params([{<<"start">>, [StartISO]} | RFields], Acc) ->
+fields_to_params(HostType, [{<<"start">>, [StartISO]} | RFields], Acc) ->
     try calendar:rfc3339_to_system_time(binary_to_list(StartISO), [{unit, microsecond}]) of
         StartStamp ->
-            fields_to_params(RFields, Acc#{ start => StartStamp })
+            fields_to_params(HostType, RFields, Acc#{ start => StartStamp })
     catch error:Error ->
             ?LOG_WARNING(#{what => inbox_invalid_form_field,
                            reason => Error, field => start, value => StartISO}),
             {error, bad_request, invalid_field_value(<<"start">>, StartISO)}
     end;
-fields_to_params([{<<"end">>, [EndISO]} | RFields], Acc) ->
+fields_to_params(HostType, [{<<"end">>, [EndISO]} | RFields], Acc) ->
     try calendar:rfc3339_to_system_time(binary_to_list(EndISO), [{unit, microsecond}]) of
         EndStamp ->
-            fields_to_params(RFields, Acc#{ 'end' => EndStamp })
+            fields_to_params(HostType, RFields, Acc#{ 'end' => EndStamp })
     catch error:Error ->
             ?LOG_WARNING(#{what => inbox_invalid_form_field,
                            reason => Error, field => 'end', value => EndISO}),
             {error, bad_request, invalid_field_value(<<"end">>, EndISO)}
     end;
-fields_to_params([{<<"order">>, [OrderBin]} | RFields], Acc) ->
+fields_to_params(HostType, [{<<"order">>, [OrderBin]} | RFields], Acc) ->
     case binary_to_order(OrderBin) of
         error ->
             ?LOG_WARNING(#{what => inbox_invalid_form_field,
                            field => order, value => OrderBin}),
             {error, bad_request, invalid_field_value(<<"order">>, OrderBin)};
         Order ->
-            fields_to_params(RFields, Acc#{ order => Order })
+            fields_to_params(HostType, RFields, Acc#{ order => Order })
     end;
 
-fields_to_params([{<<"hidden_read">>, [HiddenRead]} | RFields], Acc) ->
+fields_to_params(HostType, [{<<"hidden_read">>, [HiddenRead]} | RFields], Acc) ->
     case mod_inbox_utils:binary_to_bool(HiddenRead) of
         error ->
             ?LOG_WARNING(#{what => inbox_invalid_form_field,
                            field => hidden_read, value => HiddenRead}),
             {error, bad_request, invalid_field_value(<<"hidden_read">>, HiddenRead)};
         Hidden ->
-            fields_to_params(RFields, Acc#{ hidden_read => Hidden })
+            fields_to_params(HostType, RFields, Acc#{ hidden_read => Hidden })
     end;
 
-fields_to_params([{<<"archive">>, [Value]} | RFields], Acc) ->
+fields_to_params(HostType, [{<<"archive">>, [Value]} | RFields], Acc) ->
     case mod_inbox_utils:binary_to_bool(Value) of
         error ->
             ?LOG_WARNING(#{what => inbox_invalid_form_field,
                            field => archive, value => Value}),
             {error, bad_request, invalid_field_value(<<"archive">>, Value)};
         true ->
-            fields_to_params(RFields, Acc#{ archive => 1 });
+            fields_to_params(HostType, RFields, Acc#{ box => [<<"archive">>] });
         false ->
-            fields_to_params(RFields, Acc#{ archive => 0 })
+            fields_to_params(HostType, RFields, Acc#{ box => [<<"inbox">>] })
     end;
 
-fields_to_params([{<<"FORM_TYPE">>, _} | RFields], Acc) ->
-    fields_to_params(RFields, Acc);
-fields_to_params([{Invalid, [InvalidFieldVal]} | _], _) ->
+fields_to_params(HostType, [{<<"box">>, [_|_] = Values} | RFields], Acc) ->
+    case validate_boxes(HostType, Values) of
+        false ->
+            ?LOG_WARNING(#{what => inbox_invalid_form_field,
+                           field => archive, value => Values}),
+            {error, bad_request, invalid_field_value(<<"box">>, Values)};
+        true ->
+            fields_to_params(HostType, RFields, Acc#{ box => Values })
+    end;
+
+fields_to_params(HostType, [{<<"FORM_TYPE">>, _} | RFields], Acc) ->
+    fields_to_params(HostType, RFields, Acc);
+fields_to_params(_, [{Invalid, [InvalidFieldVal]} | _], _) ->
     ?LOG_INFO(#{what => inbox_invalid_form_field, reason => unknown_field,
                 field => Invalid, value => InvalidFieldVal}),
     {error, bad_request, <<"Unknown inbox form field=", Invalid/binary, ", value=", InvalidFieldVal/binary>>}.
@@ -500,7 +523,13 @@ binary_to_order(<<"desc">>) -> desc;
 binary_to_order(<<"asc">>) -> asc;
 binary_to_order(_) -> error.
 
-invalid_field_value(Field, Value) ->
+validate_boxes(HostType, Boxes) ->
+    AllBoxes = gen_mod:get_module_opt(HostType, ?MODULE, boxes),
+    lists:all(fun(ReqBox) -> lists:member(ReqBox, AllBoxes) end, Boxes).
+
+invalid_field_value(Field, Values) when is_list(Values) ->
+    invalid_field_value(Field, erlang:list_to_binary(Values));
+invalid_field_value(Field, Value) when is_binary(Value) ->
     <<"Invalid inbox form field value, field=", Field/binary, ", value=", Value/binary>>.
 
 %%%%%%%%%%%%%%%%%%%

@@ -85,6 +85,12 @@ init(HostType, _Options) ->
                                  [<<"content">>, <<"msg_id">>, <<"timestamp">>, <<"archive">>,
                                   {<<"unread_count">>, <<"unread_count = inbox.unread_count + ?">>}],
                                  UniqueKeyFields),
+    % inbox boxes
+    mongoose_rdbms:prepare(inbox_select_boxes, inbox_boxes, [],
+                           <<"SELECT name, id FROM inbox_boxes">>),
+    mongoose_rdbms:prepare(inbox_insert_box, inbox_boxes, [name, id],
+                           <<"INSERT INTO inbox_boxes(name, id) VALUES (?, ?)">>),
+
     ok.
 
 -spec get_inbox(HostType :: mongooseim:host_type(),
