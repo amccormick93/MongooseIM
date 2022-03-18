@@ -42,12 +42,14 @@
 
 -export([join/2,
          prepare_upsert/6,
+         prepare_upsert/7,
          execute_upsert/5,
-         request_upsert/5]).
+         execute_upsert/6,
+         request_upsert/5,
+         request_upsert/6]).
 
 -ignore_xref([
-    request_upsert/5, count_records_where/3,
-    get_db_specific_limits/1, get_db_specific_offset/2, get_db_type/0
+    count_records_where/3, get_db_specific_limits/1, get_db_specific_offset/2, get_db_type/0
 ]).
 
 %% We have only two compile time options for db queries:
@@ -55,7 +57,6 @@
 %%-define(mssql, true).
 -ifndef(mssql).
 -undef(generic).
--define(generic, true).
 -endif.
 
 -define(RDBMS_TYPE, (mongoose_rdbms:db_type())).
@@ -83,11 +84,20 @@ get_db_type() ->
                      UpdateParams :: [any()],
                      UniqueKeyValues :: [any()]) -> mongoose_rdbms:query_result().
 execute_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues) ->
+    execute_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues, []).
+
+-spec execute_upsert(Host :: mongoose_rdbms:server(),
+                     Name :: atom(),
+                     InsertParams :: [any()],
+                     UpdateParams :: [any()],
+                     UniqueKeyValues :: [any()],
+                     IncrementalFields :: [any()]) -> mongoose_rdbms:query_result().
+execute_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields) ->
     case {mongoose_rdbms:db_engine(Host), mongoose_rdbms:db_type()} of
         {mysql, _} ->
             mongoose_rdbms:execute(Host, Name, InsertParams ++ UpdateParams);
         {pgsql, _} ->
-            mongoose_rdbms:execute(Host, Name, InsertParams ++ UpdateParams);
+            mongoose_rdbms:execute(Host, Name, InsertParams ++ UpdateParams ++ IncrementalFields);
         {odbc, mssql} ->
             mongoose_rdbms:execute(Host, Name, UniqueKeyValues ++ InsertParams ++ UpdateParams);
         NotSupported -> erlang:error({rdbms_not_supported, NotSupported})
@@ -99,11 +109,20 @@ execute_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues) ->
                      UpdateParams :: [any()],
                      UniqueKeyValues :: [any()]) -> reference().
 request_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues) ->
+    request_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues, []).
+
+-spec request_upsert(Host :: mongoose_rdbms:server(),
+                     Name :: atom(),
+                     InsertParams :: [any()],
+                     UpdateParams :: [any()],
+                     UniqueKeyValues :: [any()],
+                     IncrementalFields :: [any()]) -> reference().
+request_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields) ->
     case {mongoose_rdbms:db_engine(Host), mongoose_rdbms:db_type()} of
         {mysql, _} ->
             mongoose_rdbms:execute_request(Host, Name, InsertParams ++ UpdateParams);
         {pgsql, _} ->
-            mongoose_rdbms:execute_request(Host, Name, InsertParams ++ UpdateParams);
+            mongoose_rdbms:execute_request(Host, Name, InsertParams ++ UpdateParams ++ IncrementalFields);
         {odbc, mssql} ->
             mongoose_rdbms:execute_request(Host, Name, UniqueKeyValues ++ InsertParams ++ UpdateParams);
         NotSupported -> erlang:error({rdbms_not_supported, NotSupported})
@@ -120,9 +139,20 @@ request_upsert(Host, Name, InsertParams, UpdateParams, UniqueKeyValues) ->
                      UniqueKeyFields :: [binary()]) ->
     {ok, QueryName :: atom()} | {error, already_exists}.
 prepare_upsert(Host, Name, Table, InsertFields, Updates, UniqueKeyFields) ->
-    SQL = upsert_query(Host, Table, InsertFields, Updates, UniqueKeyFields),
+    prepare_upsert(Host, Name, Table, InsertFields, Updates, UniqueKeyFields, []).
+
+-spec prepare_upsert(Host :: mongoose_rdbms:server(),
+                     QueryName :: atom(),
+                     TableName :: atom(),
+                     InsertFields :: [binary()],
+                     Updates :: [binary() | {binary(), binary()}],
+                     UniqueKeyFields :: [binary()],
+                     IncrementalFields :: [binary()]) ->
+    {ok, QueryName :: atom()} | {error, already_exists}.
+prepare_upsert(Host, Name, Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields) ->
+    SQL = upsert_query(Host, Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields),
     Query = iolist_to_binary(SQL),
-    ?LOG_DEBUG(#{what => rdbms_upsert_query, name => Name, query => Query}),
+    ?LOG_ERROR(#{what => rdbms_upsert_query, name => Name, query => Query}),
     Fields = prepared_upsert_fields(InsertFields, Updates, UniqueKeyFields),
     mongoose_rdbms:prepare(Name, Table, Fields, Query).
 
@@ -134,12 +164,12 @@ prepared_upsert_fields(InsertFields, Updates, UniqueKeyFields) ->
         _ -> InsertFields ++ UpdateFields
     end.
 
-upsert_query(Host, Table, InsertFields, Updates, UniqueKeyFields) ->
+upsert_query(Host, Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields) ->
     case {mongoose_rdbms:db_engine(Host), mongoose_rdbms:db_type()} of
         {mysql, _} ->
-            upsert_mysql_query(Table, InsertFields, Updates, UniqueKeyFields);
+            upsert_mysql_query(Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields);
         {pgsql, _} ->
-            upsert_pgsql_query(Table, InsertFields, Updates, UniqueKeyFields);
+            upsert_pgsql_query(Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields);
         {odbc, mssql} ->
             upsert_mssql_query(Table, InsertFields, Updates, UniqueKeyFields);
         NotSupported -> erlang:error({rdbms_not_supported, NotSupported})
@@ -154,22 +184,44 @@ mysql_and_pgsql_insert(Table, Columns) ->
      join(Placeholders, ", "),
      ")"].
 
-upsert_mysql_query(Table, InsertFields, Updates, [Key | _]) ->
+upsert_mysql_query(Table, InsertFields, Updates, [Key | _], IncrementalFields) ->
     Insert = mysql_and_pgsql_insert(Table, InsertFields),
-    OnConflict = mysql_on_conflict(Updates, Key),
+    OnConflict = mysql_on_conflict(Updates, Key, IncrementalFields),
     [Insert, OnConflict].
 
-upsert_pgsql_query(Table, InsertFields, Updates, UniqueKeyFields) ->
+upsert_pgsql_query(Table, InsertFields, Updates, UniqueKeyFields, IncrementalFields) ->
     Insert = mysql_and_pgsql_insert(Table, InsertFields),
     OnConflict = pgsql_on_conflict(Updates, UniqueKeyFields),
-    [Insert, OnConflict].
+    WhereIncrements = pgsql_ensure_increments(Table, IncrementalFields),
+    [Insert, OnConflict, WhereIncrements].
 
-mysql_on_conflict([], Key) ->
+mysql_on_conflict([], Key, _) ->
     %% Update field to itself (no-op), there is no 'DO NOTHING' in MySQL
     [" ON DUPLICATE KEY UPDATE ", Key, " = ", Key];
-mysql_on_conflict(UpdateFields, _) ->
+mysql_on_conflict(UpdateFields, _, []) ->
     [" ON DUPLICATE KEY UPDATE ",
-     update_fields_on_conflict(UpdateFields)].
+     update_fields_on_conflict(UpdateFields)];
+mysql_on_conflict(UpdateFields, _, IncrementalFields) ->
+    FieldsWithPlaceHolders = [mysql_fields_with_placeholders(Update, IncrementalFields)
+                              || Update <- UpdateFields],
+    IncrUpdates = join(FieldsWithPlaceHolders, ", "),
+    [" ON DUPLICATE KEY UPDATE ", IncrUpdates].
+
+% get_field_expression({_, FieldExpr}) ->
+%     case binary:match(FieldExpr, <<"=">>) of
+%         nomatch -> false;
+%         _ -> {true, FieldExpr}
+%     end;
+% get_field_expression(FieldExpr) ->
+%     binary:match(FieldExpr, <<"=">>) =:= nomatch.
+mysql_fields_with_placeholders(UpdateField, [IncrementalField | _]) ->
+    case get_field_expression(UpdateField) of
+        {true, Expr} -> Expr;
+        true ->
+            [ UpdateField, " = IF(", IncrementalField, " < VALUES(", IncrementalField, "), VALUES(", UpdateField, "), ", UpdateField, ")"];
+        false ->
+            UpdateField
+    end.
 
 pgsql_on_conflict([], UniqueKeyFields) ->
     JoinedKeys = join(UniqueKeyFields, ", "),
@@ -183,6 +235,10 @@ pgsql_on_conflict(UpdateFields, UniqueKeyFields) ->
 update_fields_on_conflict(Updates) ->
     FieldsWithPlaceHolders = [update_field_expression(Update) || Update <- Updates],
     join(FieldsWithPlaceHolders, ", ").
+
+pgsql_ensure_increments(Table, IncrementalFields) ->
+    TableBin = atom_to_list(Table),
+    [" WHERE " | [ [TableBin, ".", Field, " <= ? "] || Field <- IncrementalFields ] ].
 
 upsert_mssql_query(Table, InsertFields, Updates, UniqueKeyFields) ->
     UniqueKeysInSelect = [[" ? AS ", Key] || Key <- UniqueKeyFields],

@@ -69,16 +69,17 @@ init(HostType, _Options) ->
     UniqueKeyFields = [<<"luser">>, <<"lserver">>, <<"remote_bare_jid">>],
     InsertFields =
         UniqueKeyFields ++ [<<"content">>, <<"unread_count">>, <<"msg_id">>, <<"timestamp">>],
+    IncrementalFields = [<<"timestamp">>],
     rdbms_queries:prepare_upsert(HostType, inbox_upsert, inbox,
                                  InsertFields,
                                  [<<"content">>, <<"unread_count">>,
                                   <<"msg_id">>, <<"timestamp">>, <<"archive">>],
-                                 UniqueKeyFields),
+                                 UniqueKeyFields, IncrementalFields),
     rdbms_queries:prepare_upsert(HostType, inbox_upsert_incr_unread, inbox,
                                  InsertFields,
                                  [<<"content">>, <<"msg_id">>, <<"timestamp">>, <<"archive">>,
                                   {<<"unread_count">>, <<"unread_count = inbox.unread_count + ?">>}],
-                                 UniqueKeyFields),
+                                 UniqueKeyFields, IncrementalFields),
     ok.
 
 -spec get_inbox(HostType :: mongooseim:host_type(),
@@ -111,12 +112,13 @@ get_inbox_unread(HostType, {LUser, LServer, RemBareJID}) ->
       MsgId :: binary(),
       Timestamp :: integer().
 set_inbox(HostType, {LUser, LServer, LToBareJid}, Content, Count, MsgId, Timestamp) ->
-    InsertParams = [LUser, LServer, LToBareJid,
-                    Content, Count, MsgId, Timestamp],
+    InsertParams = [LUser, LServer, LToBareJid, Content, Count, MsgId, Timestamp],
     UpdateParams = [Content, Count, MsgId, Timestamp, false],
-    UniqueKeyValues  = [LUser, LServer, LToBareJid],
-    Res = rdbms_queries:execute_upsert(HostType, inbox_upsert,
-                                       InsertParams, UpdateParams, UniqueKeyValues),
+    UniqueKeyValues = [LUser, LServer, LToBareJid],
+    IncrementalFields = [Timestamp],
+    Res = rdbms_queries:execute_upsert(
+            HostType, inbox_upsert,
+            InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields),
     %% MySQL returns 1 when an upsert is an insert
     %% and 2, when an upsert acts as update
     check_result_is_expected(Res, [1, 2]).
@@ -148,9 +150,11 @@ set_inbox_incr_unread(HostType, Entry, Content, MsgId, Timestamp) ->
 set_inbox_incr_unread(HostType, {LUser, LServer, LToBareJid}, Content, MsgId, Timestamp, Incrs) ->
     InsertParams = [LUser, LServer, LToBareJid, Content, Incrs, MsgId, Timestamp],
     UpdateParams = [Content, MsgId, Timestamp, false, Incrs],
-    UniqueKeyValues  = [LUser, LServer, LToBareJid],
-    Res = rdbms_queries:execute_upsert(HostType, inbox_upsert_incr_unread,
-                                       InsertParams, UpdateParams, UniqueKeyValues),
+    UniqueKeyValues = [LUser, LServer, LToBareJid],
+    IncrementalFields = [Timestamp],
+    Res = rdbms_queries:execute_upsert(
+            HostType, inbox_upsert_incr_unread,
+            InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields),
     check_result(Res).
 
 -spec reset_unread(HosType :: mongooseim:host_type(),

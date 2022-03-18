@@ -59,13 +59,15 @@ request_one(HostType, {set_inbox, {LUser, LServer, LToBareJid}, Content, Count, 
     InsertParams = [LUser, LServer, LToBareJid, Content, Count, MsgId, Timestamp],
     UpdateParams = [Content, Count, MsgId, Timestamp, false],
     UniqueKeyValues  = [LUser, LServer, LToBareJid],
-    rdbms_queries:request_upsert(HostType, inbox_upsert, InsertParams, UpdateParams, UniqueKeyValues);
+    IncrementalFields = [Timestamp],
+    rdbms_queries:request_upsert(HostType, inbox_upsert, InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields);
 
 request_one(HostType, {set_inbox_incr_unread, {LUser, LServer, LToBareJid}, Content, MsgId, Timestamp, Incrs}) ->
     InsertParams = [LUser, LServer, LToBareJid, Content, Incrs, MsgId, Timestamp],
     UpdateParams = [Content, MsgId, Timestamp, false, Incrs],
     UniqueKeyValues  = [LUser, LServer, LToBareJid],
-    rdbms_queries:request_upsert(HostType, inbox_upsert_incr_unread, InsertParams, UpdateParams, UniqueKeyValues);
+    IncrementalFields = [Timestamp],
+    rdbms_queries:request_upsert(HostType, inbox_upsert_incr_unread, InsertParams, UpdateParams, UniqueKeyValues, IncrementalFields);
 
 request_one(HostType, {remove_inbox_row, {LUser, LServer, LToBareJid}}) ->
     mongoose_rdbms:execute_request(HostType, inbox_delete_row, [LUser, LServer, LToBareJid]);
